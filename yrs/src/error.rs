@@ -15,6 +15,6 @@ pub enum Error {
 pub enum UpdateError {
     #[error("block parent {0} must be deleted or shared ref type. Type: {1}")]
     InvalidParent(ID, u8),
-    #[error("block {0} of length {1} overlaps blocks already integrated")]
+    #[error("block {0} of length {1} does not fit the client's integrated blocks")]
     BlockOutOfPlace(ID, u32),
 }

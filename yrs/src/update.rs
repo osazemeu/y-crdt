@@ -1986,6 +1986,20 @@ mod test {
             assert!(store.can_push(&ID::new(ClientID::new(8), 5), 1));
             assert_eq!(text.get_string(&txn), "ab");
 
+            // integrate directly, past apply_update's exclude of known content, so the guard
+            // in Update::integrate is what refuses the block
+            let mut dup = Update::decode_v1(&honest[0]).unwrap();
+            match dup.integrate(&mut txn) {
+                Err(crate::error::UpdateError::BlockOutOfPlace(id, len)) => {
+                    assert_eq!(id, ID::new(ClientID::new(7), 0));
+                    assert_eq!(len, 2);
+                }
+                Err(e) => panic!("unexpected error: {}", e),
+                Ok(_) => panic!("a block over integrated content was accepted"),
+            }
+            assert_eq!(text.get_string(&txn), "ab");
+            assert_eq!(text.len(&txn), 2);
+
             // inside a skip a block fits only when it ends at or before the skip's end
             txn.apply_update(Update::decode_v1(&far_ahead_item(9)).unwrap())
                 .unwrap();

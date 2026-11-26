@@ -307,6 +307,9 @@ impl BlockStore {
 
     /// Checks that [BlockStore::push] can take a block of `len` at `id`: it either starts at the
     /// client's current clock or lies entirely inside an integrated skip.
+    /// Relies on every client's block list starting at clock 0 and being contiguous
+    /// (find_index's `mid - 1` underflows otherwise), which push and the skip in
+    /// Update::integrate guarantee.
     pub(crate) fn can_push(&self, id: &ID, len: u32) -> bool {
         let Some(list) = self.clients.get(&id.client) else {
             return true;
