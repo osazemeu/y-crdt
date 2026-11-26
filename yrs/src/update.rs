@@ -341,7 +341,6 @@ impl Update {
                     let local_clock = state
                         .entry(id.client)
                         .or_insert_with(|| txn.store.blocks.get_clock(&id.client));
-                    let offset = (*local_clock as i32) - (id.clock as i32);
 
                     if let Some(missing) =
                         Self::missing_dependency(&mut stack_head, &mut txn.store)?
@@ -351,17 +350,25 @@ impl Update {
                         continue;
                     } else {
                         // block has no missing dependencies, therefore we can integrate it right away
-                        if offset < 0 {
+                        // Compare clocks as u32: a signed difference misorders clocks at or
+                        // past 2^31 and skips the hole below a block far ahead of local state.
+                        if id.clock > *local_clock {
                             // Block was send out of order (previous blocks from the same client are
                             // missing), however since it has no dependency on them, it's still safe
                             // to integrate. For that we prepend the missing hole with a Skip block.
                             txn.integrate_skip(
                                 BlockRange::new(
                                     ID::new(id.client, *local_clock),
-                                    offset.abs() as u32,
+                                    id.clock - *local_clock,
                                 ),
                                 0,
                             );
+                        }
+                        // integrate_item links an item into its parent before BlockStore::push
+                        // stores it, and a failed push cannot unlink it, so refuse a block the
+                        // store cannot take before anything points at it.
+                        if !txn.store.blocks.can_push(&id, len) {
+                            return Err(UpdateError::BlockOutOfPlace(id, len));
                         }
                         txn.integrate(stack_head, 0);
                         *local_clock = (*local_clock).max(id.clock + len);
@@ -1793,19 +1800,26 @@ mod test {
             assert!(Update::decode_v2(&write_sections(EncoderV2::new(), &once)).is_ok());
             assert_matches!(
                 Update::decode_v1(&write_sections(EncoderV1::new(), &twice)),
-                Err(Error::Custom(_))
+                Err(Error::Custom(m)) if m == "client 1 listed twice in update"
             );
             assert_matches!(
                 Update::decode_v2(&write_sections(EncoderV2::new(), &twice)),
-                Err(Error::Custom(_))
+                Err(Error::Custom(m)) if m == "client 1 listed twice in update"
             );
         }
 
         #[test]
         fn struct_clock_overflow_is_rejected() {
-            // ContentDeleted of length u32::MAX at clock 1 under root type "t".
-            let bytes = [1, 1, 1, 1, 1, 1, 1, b't', 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0];
-            assert_matches!(Update::decode_v1(&bytes), Err(Error::Custom(_)));
+            const MSG: &str = "struct clock range overflows u32";
+            // ContentDeleted of length u32::MAX under root type "t": at clock 0 it ends exactly
+            // at u32::MAX, at clock 1 it passes it.
+            let at = |clock: u8| {
+                [
+                    1, 1, 1, clock, 1, 1, 1, b't', 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0,
+                ]
+            };
+            assert!(Update::decode_v1(&at(0)).is_ok());
+            assert_matches!(Update::decode_v1(&at(1)), Err(Error::Custom(m)) if m == MSG);
 
             let wraps = skip(u32::MAX, 1);
             let fits = skip(u32::MAX - 1, 1);
@@ -1816,8 +1830,8 @@ mod test {
                 assert_eq!(v1.is_ok(), ok, "v1 clock {clock}");
                 assert_eq!(v2.is_ok(), ok, "v2 clock {clock}");
                 if !ok {
-                    assert_matches!(v1, Err(Error::Custom(_)));
-                    assert_matches!(v2, Err(Error::Custom(_)));
+                    assert_matches!(v1, Err(Error::Custom(m)) if m == MSG);
+                    assert_matches!(v2, Err(Error::Custom(m)) if m == MSG);
                 }
             }
         }
@@ -1836,9 +1850,10 @@ mod test {
             }
             assert!(Update::decode_v1(&ds_update(EncoderV1::new(), u32::MAX - 1)).is_ok());
             assert!(Update::decode_v2(&ds_update(EncoderV2::new(), u32::MAX - 1)).is_ok());
+            const MSG: &str = "delete set clock range overflows u32";
             assert_matches!(
                 Update::decode_v1(&ds_update(EncoderV1::new(), u32::MAX)),
-                Err(Error::Custom(_))
+                Err(Error::Custom(m)) if m == MSG
             );
             // EncoderV2::write_ds_len would itself overflow here, so write its byte by hand:
             // a v2 delete set length is stored as `len - 1`.
@@ -1850,7 +1865,136 @@ mod test {
             enc.write_var(1u32);
             enc.write_ds_clock(u32::MAX);
             enc.write_var(0u32);
-            assert_matches!(Update::decode_v2(&enc.to_vec()), Err(Error::Custom(_)));
+            assert_matches!(Update::decode_v2(&enc.to_vec()), Err(Error::Custom(m)) if m == MSG);
+        }
+
+        #[test]
+        fn repeated_delete_set_client_is_rejected() {
+            fn ds_update<E: Encoder>(mut enc: E, sections: &[u32]) -> Vec<u8> {
+                enc.write_var(0u32); // no struct sections
+                enc.write_var(sections.len() as u32);
+                for &clock in sections {
+                    enc.reset_ds_cur_val();
+                    enc.write_var(1u64);
+                    enc.write_var(1u32); // one range
+                    enc.write_ds_clock(clock);
+                    enc.write_ds_len(1);
+                }
+                enc.to_vec()
+            }
+            const MSG: &str = "client 1 listed twice in delete set";
+            let v1 = Update::decode_v1(&ds_update(EncoderV1::new(), &[0])).unwrap();
+            let v2 = Update::decode_v2(&ds_update(EncoderV2::new(), &[0])).unwrap();
+            assert_eq!(v1.delete_set, v2.delete_set);
+            assert_matches!(
+                Update::decode_v1(&ds_update(EncoderV1::new(), &[0, 5])),
+                Err(Error::Custom(m)) if m == MSG
+            );
+            assert_matches!(
+                Update::decode_v2(&ds_update(EncoderV2::new(), &[0, 5])),
+                Err(Error::Custom(m)) if m == MSG
+            );
+
+            // A snapshot's delete set goes through the same decoder.
+            let snapshot = |sections: &[u32]| {
+                let mut enc = EncoderV1::new();
+                enc.write_var(sections.len() as u32);
+                for &clock in sections {
+                    enc.write_var(1u64);
+                    enc.write_var(1u32);
+                    enc.write_ds_clock(clock);
+                    enc.write_ds_len(1);
+                }
+                enc.write_var(0u32); // empty state vector
+                crate::Snapshot::decode_v1(&enc.to_vec())
+            };
+            assert!(snapshot(&[0]).is_ok());
+            assert_matches!(snapshot(&[0, 5]), Err(Error::Custom(m)) if m == MSG);
+        }
+
+        /// One String item "x" under root text "t" for `client` at clock 0xC000_0000, past 2^31.
+        fn far_ahead_item(client: u8) -> [u8; 15] {
+            [
+                1, 1, client, 0x80, 0x80, 0x80, 0x80, 0x0C, 4, 1, 1, b't', 1, b'x', 0,
+            ]
+        }
+
+        fn insert_from(client: u64, edits: &[&str]) -> Vec<Vec<u8>> {
+            let doc = Doc::with_client_id(client);
+            let text = doc.get_or_insert_text("t");
+            edits
+                .iter()
+                .map(|s| {
+                    let sv = doc.transact().state_vector();
+                    let len = text.len(&doc.transact());
+                    text.insert(&mut doc.transact_mut(), len, s);
+                    doc.transact().encode_state_as_update_v1(&sv)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn far_ahead_clock_of_known_client_leaves_a_skip() {
+            let honest = insert_from(7, &["a", "b"]);
+            let doc = Doc::with_client_id(1);
+            let text = doc.get_or_insert_text("t");
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&honest[0]).unwrap())
+                .unwrap();
+            txn.apply_update(Update::decode_v1(&far_ahead_item(7)).unwrap())
+                .unwrap();
+            // the hole below the far block is a skip, so the state vector stays at real content
+            assert_eq!(txn.state_vector().get(&ClientID::new(7)), 1);
+            assert_eq!(text.get_string(&txn), "xa");
+            // and later honest content from that client still fills it
+            txn.apply_update(Update::decode_v1(&honest[1]).unwrap())
+                .unwrap();
+            assert_eq!(txn.state_vector().get(&ClientID::new(7)), 2);
+            assert_eq!(text.get_string(&txn), "xab");
+        }
+
+        #[test]
+        fn far_ahead_clock_of_unknown_client_leaves_a_skip() {
+            let honest = insert_from(7, &["a"]);
+            let doc = Doc::with_client_id(1);
+            let text = doc.get_or_insert_text("t");
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&far_ahead_item(7)).unwrap())
+                .unwrap();
+            assert_eq!(txn.state_vector().get(&ClientID::new(7)), 0);
+            txn.apply_update(Update::decode_v1(&honest[0]).unwrap())
+                .unwrap();
+            assert_eq!(txn.state_vector().get(&ClientID::new(7)), 1);
+            // both items have no origins and one client, so order follows arrival (as in yjs)
+            assert_eq!(text.get_string(&txn), "ax");
+        }
+
+        #[test]
+        fn block_overlapping_integrated_content_is_refused() {
+            // Two honest items, then a block placed over the first: push would replace a real
+            // item, so apply refuses it before linking.
+            let honest = insert_from(7, &["ab"]);
+            let doc = Doc::with_client_id(1);
+            let text = doc.get_or_insert_text("t");
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&honest[0]).unwrap())
+                .unwrap();
+            let store = &txn.store().blocks;
+            let id = ID::new(ClientID::new(7), 0);
+            assert!(!store.can_push(&id, 1));
+            assert!(store.can_push(&ID::new(ClientID::new(7), 2), 1));
+            assert!(store.can_push(&ID::new(ClientID::new(8), 5), 1));
+            assert_eq!(text.get_string(&txn), "ab");
+
+            // inside a skip a block fits only when it ends at or before the skip's end
+            txn.apply_update(Update::decode_v1(&far_ahead_item(9)).unwrap())
+                .unwrap();
+            let store = &txn.store().blocks;
+            let client = ClientID::new(9);
+            assert!(store.can_push(&ID::new(client, 0), 0xC000_0000));
+            assert!(store.can_push(&ID::new(client, 0xBFFF_FFFF), 1));
+            assert!(!store.can_push(&ID::new(client, 0xBFFF_FFFF), 2));
+            assert!(!store.can_push(&ID::new(client, 0xC000_0000), 1));
         }
 
         #[test]

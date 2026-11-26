@@ -364,7 +364,18 @@ impl Decode for IdSet {
             decoder.reset_ds_cur_val();
             let client: u64 = decoder.read_var()?;
             let range = IdRange::decode(decoder)?;
-            set.0.clients_mut().insert(ClientID::new(client), range);
+            // yjs applies every section, so keeping only the last copy of a repeated client
+            // would make this replica diverge from yjs peers. Honest encoders write each once.
+            if set
+                .0
+                .clients_mut()
+                .insert(ClientID::new(client), range)
+                .is_some()
+            {
+                return Err(Error::Custom(format!(
+                    "client {client} listed twice in delete set"
+                )));
+            }
             i += 1;
         }
         Ok(set)

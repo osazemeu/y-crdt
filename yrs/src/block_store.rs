@@ -305,6 +305,29 @@ impl BlockStore {
         }
     }
 
+    /// Checks that [BlockStore::push] can take a block of `len` at `id`: it either starts at the
+    /// client's current clock or lies entirely inside an integrated skip.
+    pub(crate) fn can_push(&self, id: &ID, len: u32) -> bool {
+        let Some(list) = self.clients.get(&id.client) else {
+            return true;
+        };
+        match list.last() {
+            Some(last) if last.as_ref().next_clock() != id.clock => {
+                let Some(index) = list.find_index(id.clock) else {
+                    return false;
+                };
+                let block = unsafe { &*list.inner[index].get() };
+                block.is_skip()
+                    && id.clock >= block.clock_start()
+                    && id
+                        .clock
+                        .checked_add(len)
+                        .is_some_and(|end| end <= block.next_clock())
+            }
+            _ => true,
+        }
+    }
+
     pub fn push(&mut self, block: Block) {
         let id = block.id();
         match self.clients.entry(id.client) {
