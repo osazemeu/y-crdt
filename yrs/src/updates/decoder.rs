@@ -195,6 +195,10 @@ impl<'a> Decoder for DecoderV1<'a> {
     }
 }
 
+fn ds_overflow() -> Error {
+    Error::Custom("delete set clock range overflows u32".to_string())
+}
+
 /// Version 2 of lib0 decoder.
 pub struct DecoderV2<'a> {
     cursor: Cursor<'a>,
@@ -304,13 +308,18 @@ impl<'a> Decoder for DecoderV2<'a> {
     }
 
     fn read_ds_clock(&mut self) -> Result<u32, Error> {
-        self.ds_curr_val += self.cursor.read_var::<u32>()?;
+        let diff = self.cursor.read_var::<u32>()?;
+        self.ds_curr_val = self.ds_curr_val.checked_add(diff).ok_or_else(ds_overflow)?;
         Ok(self.ds_curr_val)
     }
 
     fn read_ds_len(&mut self) -> Result<u32, Error> {
-        let diff = self.cursor.read_var::<u32>()? + 1;
-        self.ds_curr_val += diff;
+        let diff = self
+            .cursor
+            .read_var::<u32>()?
+            .checked_add(1)
+            .ok_or_else(ds_overflow)?;
+        self.ds_curr_val = self.ds_curr_val.checked_add(diff).ok_or_else(ds_overflow)?;
         Ok(diff)
     }
 

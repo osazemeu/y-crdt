@@ -648,7 +648,6 @@ impl DocAddr {
 #[cfg(test)]
 mod test {
     use crate::block::{Block, BlockRange, ClientID, ItemContent};
-    use crate::encoding::read::MalformedKind;
     use crate::error::Error;
     use crate::test_utils::{exchange_updates, Blocks};
     use crate::transaction::{ReadTxn, TransactionMut};
@@ -2039,16 +2038,16 @@ mod test {
 
     #[test]
     fn encoding_buffer_overflow_errors() {
-        assert_matches!(
+        assert!(matches!(
             Update::decode_v1(&vec![
                 0xe4, 0x9c, 0x10, 0x00, 0x05, 0xff, 0xff, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
                 0x01, 0x00, 0x00, 0x00, 0xed, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0xfe, 0xb8, 0xc2,
                 0xe9, 0xad, 0x87, 0xd9, 0x12, 0x00, 0x00, 0x01, 0x01, 0xff, 0xed, 0xf6,
             ]),
-            Err(crate::encoding::read::Error::Malformed(
-                MalformedKind::EmptyBlock
-            ))
-        );
+            // client 0 heads two sections, which is rejected before the empty block further on
+            // is reached
+            Err(crate::encoding::read::Error::Custom(msg)) if msg == "client 0 listed twice in update"
+        ));
 
         assert_matches!(
             Update::decode_v2(&vec![

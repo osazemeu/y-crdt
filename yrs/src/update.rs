@@ -847,10 +847,16 @@ impl Decode for Update {
 
             let client = decoder.read_client()?;
             let mut clock: u32 = decoder.read_var()?;
-            let blocks = blocks
-                .clients
-                .entry(client)
-                .or_insert_with(|| VecDeque::new());
+            // Honest encoders write each client once. A repeated client would append its second
+            // section at arbitrary clocks, which apply never trims within one update.
+            let blocks = match blocks.clients.entry(client) {
+                Entry::Vacant(e) => e.insert(VecDeque::new()),
+                Entry::Occupied(_) => {
+                    return Err(Error::Custom(format!(
+                        "client {client} listed twice in update"
+                    )))
+                }
+            };
             // Attempt to pre-allocate memory for the blocks. If the capacity overflows and
             // allocation fails, return an error.
             blocks.try_reserve(blocks_len)?;
@@ -860,7 +866,9 @@ impl Decode for Update {
                 if let Some(block) = Self::decode_block(id, decoder)? {
                     // due to bug in the past it was possible for empty bugs to be generated
                     // even though they had no effect on the document store
-                    clock += block.len();
+                    clock = clock.checked_add(block.len()).ok_or_else(|| {
+                        Error::Custom("struct clock range overflows u32".to_string())
+                    })?;
                     blocks.push_back(block);
                 }
             }
@@ -1736,6 +1744,143 @@ mod test {
         use crate::updates::decoder::Decode;
         use crate::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
         use std::assert_matches;
+
+        use crate::block::{Block, BlockRange, ClientID};
+        use crate::encoding::write::Write;
+        use crate::updates::encoder::{Encode, Encoder, EncoderV1, EncoderV2};
+        use crate::{Map, ID};
+
+        /// Writes one section per `(clock, block)`, repeating a client if asked, which honest
+        /// encoders never do since they iterate a map keyed by client.
+        fn write_sections<E: Encoder>(mut enc: E, sections: &[(u32, &Block)]) -> Vec<u8> {
+            enc.write_var(sections.len() as u32);
+            for (clock, block) in sections {
+                enc.write_var(1u32);
+                enc.write_client(block.id().client);
+                enc.write_var(*clock);
+                block.encode_with_offset(&mut enc, 0);
+            }
+            enc.write_var(0u32); // empty delete set
+            enc.to_vec()
+        }
+
+        fn map_set_block(client: u64) -> Block {
+            let doc = Doc::with_client_id(client);
+            let map = doc.get_or_insert_map("m");
+            let mut txn = doc.transact_mut();
+            map.insert(&mut txn, "k0", 1);
+            let mut update = Update::decode_v1(&txn.encode_update_v1()).unwrap();
+            let blocks = update
+                .blocks
+                .clients
+                .get_mut(&ClientID::new(client))
+                .unwrap();
+            assert_eq!(blocks.len(), 1);
+            blocks.pop_front().unwrap()
+        }
+
+        fn skip(clock: u32, len: u32) -> Block {
+            Block::Skip(BlockRange::new(ID::new(ClientID::new(1), clock), len))
+        }
+
+        #[test]
+        fn repeated_client_is_rejected() {
+            let item = map_set_block(1);
+            let once = [(0, &item)];
+            let twice = [(0, &item), (0, &item)];
+
+            assert!(Update::decode_v1(&write_sections(EncoderV1::new(), &once)).is_ok());
+            assert!(Update::decode_v2(&write_sections(EncoderV2::new(), &once)).is_ok());
+            assert_matches!(
+                Update::decode_v1(&write_sections(EncoderV1::new(), &twice)),
+                Err(Error::Custom(_))
+            );
+            assert_matches!(
+                Update::decode_v2(&write_sections(EncoderV2::new(), &twice)),
+                Err(Error::Custom(_))
+            );
+        }
+
+        #[test]
+        fn struct_clock_overflow_is_rejected() {
+            // ContentDeleted of length u32::MAX at clock 1 under root type "t".
+            let bytes = [1, 1, 1, 1, 1, 1, 1, b't', 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0];
+            assert_matches!(Update::decode_v1(&bytes), Err(Error::Custom(_)));
+
+            let wraps = skip(u32::MAX, 1);
+            let fits = skip(u32::MAX - 1, 1);
+            for (clock, block, ok) in [(u32::MAX, &wraps, false), (u32::MAX - 1, &fits, true)] {
+                let sections = [(clock, block)];
+                let v1 = Update::decode_v1(&write_sections(EncoderV1::new(), &sections));
+                let v2 = Update::decode_v2(&write_sections(EncoderV2::new(), &sections));
+                assert_eq!(v1.is_ok(), ok, "v1 clock {clock}");
+                assert_eq!(v2.is_ok(), ok, "v2 clock {clock}");
+                if !ok {
+                    assert_matches!(v1, Err(Error::Custom(_)));
+                    assert_matches!(v2, Err(Error::Custom(_)));
+                }
+            }
+        }
+
+        #[test]
+        fn delete_set_clock_overflow_is_rejected() {
+            fn ds_update<E: Encoder>(mut enc: E, clock: u32) -> Vec<u8> {
+                enc.write_var(0u32); // no struct sections
+                enc.write_var(1u32); // one delete set client
+                enc.reset_ds_cur_val();
+                enc.write_var(1u64);
+                enc.write_var(1u32); // one range
+                enc.write_ds_clock(clock);
+                enc.write_ds_len(1);
+                enc.to_vec()
+            }
+            assert!(Update::decode_v1(&ds_update(EncoderV1::new(), u32::MAX - 1)).is_ok());
+            assert!(Update::decode_v2(&ds_update(EncoderV2::new(), u32::MAX - 1)).is_ok());
+            assert_matches!(
+                Update::decode_v1(&ds_update(EncoderV1::new(), u32::MAX)),
+                Err(Error::Custom(_))
+            );
+            // EncoderV2::write_ds_len would itself overflow here, so write its byte by hand:
+            // a v2 delete set length is stored as `len - 1`.
+            let mut enc = EncoderV2::new();
+            enc.write_var(0u32);
+            enc.write_var(1u32);
+            enc.reset_ds_cur_val();
+            enc.write_var(1u64);
+            enc.write_var(1u32);
+            enc.write_ds_clock(u32::MAX);
+            enc.write_var(0u32);
+            assert_matches!(Update::decode_v2(&enc.to_vec()), Err(Error::Custom(_)));
+        }
+
+        #[test]
+        fn multi_client_update_still_decodes() {
+            let a = Update::decode_v1(&encode_one(1)).unwrap();
+            let b = Update::decode_v1(&encode_one(2)).unwrap();
+            let merged = Update::merge_updates(vec![a, b]);
+            assert_eq!(merged.blocks.clients.len(), 2);
+            for update in [
+                Update::decode_v1(&merged.encode_v1()).unwrap(),
+                Update::decode_v2(&merged.encode_v2()).unwrap(),
+            ] {
+                let doc = Doc::with_client_id(3);
+                let map = doc.get_or_insert_map("m");
+                let mut txn = doc.transact_mut();
+                txn.apply_update(update).unwrap();
+                assert_eq!(map.len(&txn), 1);
+                let sv = txn.state_vector();
+                assert_eq!(sv.get(&ClientID::new(1)), 1);
+                assert_eq!(sv.get(&ClientID::new(2)), 1);
+            }
+
+            fn encode_one(client: u64) -> Vec<u8> {
+                let doc = Doc::with_client_id(client);
+                let map = doc.get_or_insert_map("m");
+                let mut txn = doc.transact_mut();
+                map.insert(&mut txn, "k0", client as i64);
+                txn.encode_update_v1()
+            }
+        }
 
         const TEXT: &str = "hello world, this is a yrs document";
 

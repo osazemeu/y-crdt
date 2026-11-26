@@ -27,7 +27,10 @@ impl Decode for Range<u32> {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, Error> {
         let clock = decoder.read_ds_clock()?;
         let len = decoder.read_ds_len()?;
-        Ok(clock..(clock + len))
+        let end = clock
+            .checked_add(len)
+            .ok_or_else(|| Error::Custom("delete set clock range overflows u32".to_string()))?;
+        Ok(clock..end)
     }
 }
 
