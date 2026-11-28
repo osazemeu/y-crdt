@@ -282,6 +282,23 @@ impl Branch {
         self.content_len
     }
 
+    /// Returns how many shared types this branch is nested in: 0 for a root type, 1 for a
+    /// type stored directly in a root, and so on. Walks the parent chain iteratively, so it
+    /// never recurses however deep the branch sits. A parent that is not a branch (one not
+    /// yet integrated) ends the walk.
+    pub fn depth(&self) -> usize {
+        let mut depth = 0;
+        let mut item = self.item;
+        while let Some(current) = item {
+            depth += 1;
+            item = match current.parent {
+                TypePtr::Branch(parent) => parent.item,
+                _ => None,
+            };
+        }
+        depth
+    }
+
     /// Get iterator over (String, Block) entries of a map component of a current root type.
     /// Deleted blocks are skipped by this iterator.
     pub(crate) fn entries<'a, T: ReadTxn + 'a>(&'a self, txn: &'a T) -> Entries<'a, &'a T, T> {

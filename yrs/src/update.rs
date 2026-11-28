@@ -1806,6 +1806,19 @@ mod test {
             txn.encode_state_as_update_v1(&StateVector::default())
         }
 
+        #[test]
+        fn branch_depth_counts_parent_hops() {
+            let doc = Doc::with_client_id(1);
+            let root = doc.get_or_insert_map("m");
+            let mut txn = doc.transact_mut();
+            assert_eq!(root.as_ref().depth(), 0);
+            let mut parent: MapRef = root;
+            for level in 1..=200 {
+                parent = parent.insert(&mut txn, "c", MapPrelim::default());
+                assert_eq!(parent.as_ref().depth(), level);
+            }
+        }
+
         fn map_depth(doc: &Doc) -> usize {
             let map = doc.get_or_insert_map("m");
             let txn = doc.transact();
