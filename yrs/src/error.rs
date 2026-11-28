@@ -17,4 +17,6 @@ pub enum UpdateError {
     InvalidParent(ID, u8),
     #[error("block {0} of length {1} does not fit the client's integrated blocks")]
     BlockOutOfPlace(ID, u32),
+    #[error("block {0} would nest a shared type deeper than {1} levels")]
+    TooDeep(ID, usize),
 }

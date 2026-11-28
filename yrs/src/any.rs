@@ -1,4 +1,4 @@
-use crate::encoding::read::{Error, Read};
+use crate::encoding::read::{Error, MalformedKind, Read};
 use crate::encoding::write::Write;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -36,7 +36,19 @@ impl Any {
         T::try_from(self)
     }
 
+    /// The deepest an [Any] map or array may nest when decoded: past it, decoding fails with
+    /// [MalformedKind::TooDeep]. Decoding recurses once per level on the caller's stack, so an
+    /// unbounded depth lets a small payload overflow it. 127 is the deepest value `serde_json`'s
+    /// default recursion limit still parses, which [Any::from_json] applies to v1 embeds and
+    /// formats: a deeper cap would accept a value whose own encoded state then fails to load.
+    pub const MAX_DEPTH: usize = 127;
+
     pub fn decode<R: Read>(decoder: &mut R) -> Result<Self, Error> {
+        Self::decode_nested(decoder, 0)
+    }
+
+    /// Decodes a value found inside `depth` enclosing maps or arrays.
+    fn decode_nested<R: Read>(decoder: &mut R, depth: usize) -> Result<Self, Error> {
         Ok(match decoder.read_u8()? {
             // CASE 127: undefined
             127 => Any::Undefined,
@@ -61,6 +73,9 @@ impl Any {
             }
             // CASE 118: Map<string,Any>
             118 => {
+                if depth >= Self::MAX_DEPTH {
+                    return Err(Error::Malformed(MalformedKind::TooDeep));
+                }
                 let len: usize = decoder.read_var()?;
                 // `len` is attacker-controlled; a fallible reservation avoids an allocation bomb
                 // (see `Update::decode`'s `try_reserve`).
@@ -68,19 +83,22 @@ impl Any {
                 map.try_reserve(len)?;
                 for _ in 0..len {
                     let key = decoder.read_string()?;
-                    map.insert(key.to_owned(), Any::decode(decoder)?);
+                    map.insert(key.to_owned(), Any::decode_nested(decoder, depth + 1)?);
                 }
                 Any::Map(Arc::new(map))
             }
             // CASE 117: Array<Any>
             117 => {
+                if depth >= Self::MAX_DEPTH {
+                    return Err(Error::Malformed(MalformedKind::TooDeep));
+                }
                 let len: usize = decoder.read_var()?;
                 // `len` is attacker-controlled; a fallible reservation avoids an allocation bomb
                 // (see `Update::decode`'s `try_reserve`).
                 let mut arr = Vec::new();
                 arr.try_reserve(len)?;
                 for _ in 0..len {
-                    arr.push(Any::decode(decoder)?);
+                    arr.push(Any::decode_nested(decoder, depth + 1)?);
                 }
                 Any::Array(Arc::from(arr))
             }
@@ -1030,6 +1048,47 @@ mod test {
     use crate::any::Any;
     use crate::encoding::read::Cursor;
     use crate::Number;
+
+    /// `levels` nested one-element arrays around a null, in the v1 `Any` encoding.
+    fn nested_arrays(levels: usize) -> Vec<u8> {
+        let mut bytes = [117u8, 1].repeat(levels);
+        bytes.push(126);
+        bytes
+    }
+
+    #[test]
+    fn decode_accepts_nesting_at_the_cap() {
+        let bytes = nested_arrays(Any::MAX_DEPTH);
+        let mut value = Any::decode(&mut Cursor::new(&bytes)).unwrap();
+        for _ in 0..Any::MAX_DEPTH {
+            value = match value {
+                Any::Array(items) => items[0].clone(),
+                other => panic!("expected an array, got {:?}", other),
+            };
+        }
+        assert_eq!(value, Any::Null);
+    }
+
+    #[test]
+    fn decode_refuses_nesting_past_the_cap() {
+        use crate::encoding::read::{Error, MalformedKind};
+        // One level past the cap, and far past it: 10,000 levels overflowed the stack before
+        // the cap and must now fail without recursing past it.
+        for levels in [Any::MAX_DEPTH + 1, 10_000] {
+            let bytes = nested_arrays(levels);
+            assert!(matches!(
+                Any::decode(&mut Cursor::new(&bytes)),
+                Err(Error::Malformed(MalformedKind::TooDeep))
+            ));
+        }
+        // a map nests the same way: tag 118, one entry with an empty key, then the value
+        let mut bytes = [118u8, 1, 0].repeat(Any::MAX_DEPTH + 1);
+        bytes.push(126);
+        assert!(matches!(
+            Any::decode(&mut Cursor::new(&bytes)),
+            Err(Error::Malformed(MalformedKind::TooDeep))
+        ));
+    }
 
     #[test]
     fn decode_map_rejects_length_amplification() {

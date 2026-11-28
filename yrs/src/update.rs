@@ -370,6 +370,12 @@ impl Update {
                         if !txn.store.blocks.can_push(&id, len) {
                             return Err(UpdateError::BlockOutOfPlace(id, len));
                         }
+                        // Readers, writers and GC walk nested shared types by native recursion,
+                        // so a type nested past the cap would overflow their stack later. Refuse
+                        // it here, before it is linked, the same way as an out-of-place block.
+                        if Self::nests_too_deep(&stack_head) {
+                            return Err(UpdateError::TooDeep(id, Self::MAX_TYPE_DEPTH));
+                        }
                         txn.integrate(stack_head, 0);
                         *local_clock = (*local_clock).max(id.clock + len);
                     }
@@ -386,6 +392,36 @@ impl Update {
         });
 
         Ok((remaining_blocks, remaining_ds))
+    }
+
+    /// The deepest a shared type may sit below its root (a root type is at depth 0).
+    pub const MAX_TYPE_DEPTH: usize = 128;
+
+    /// True when `block` is a shared type whose parent already sits at [Self::MAX_TYPE_DEPTH],
+    /// so the new type would be one level past it. Walks at most `MAX_TYPE_DEPTH` parents and
+    /// never recurses. Called after [Self::missing_dependency] has resolved the parent.
+    fn nests_too_deep(block: &Block) -> bool {
+        let Block::Item(item) = block else {
+            return false;
+        };
+        if !matches!(item.content, ItemContent::Type(_)) {
+            return false;
+        }
+        let TypePtr::Branch(mut branch) = item.parent else {
+            return false;
+        };
+        let mut parent_depth = 0;
+        while let Some(parent_item) = branch.item {
+            parent_depth += 1;
+            if parent_depth >= Self::MAX_TYPE_DEPTH {
+                return true;
+            }
+            match parent_item.parent {
+                TypePtr::Branch(grandparent) => branch = grandparent,
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn missing_dependency(
@@ -1743,6 +1779,146 @@ mod test {
 
     fn decode_update(bin: &[u8]) -> Update {
         Update::decode(&mut DecoderV1::new(Cursor::new(bin))).unwrap()
+    }
+
+    mod depth_caps {
+        use crate::encoding::read::{Error, MalformedKind};
+        use crate::error::UpdateError;
+        use crate::types::ToJson;
+        use crate::update::Update;
+        use crate::updates::decoder::Decode;
+        use crate::{Any, Doc, Map, MapPrelim, MapRef, ReadTxn, StateVector, Transact};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        /// A doc whose root map `m` holds `levels` maps, each nested in the previous one under
+        /// key "c", built one level per local insert (local writes do not pass through
+        /// `Update::integrate`, so this is how a hostile client builds one).
+        fn nested_maps(levels: usize) -> Vec<u8> {
+            let doc = Doc::with_client_id(1);
+            let root = doc.get_or_insert_map("m");
+            let mut txn = doc.transact_mut();
+            let mut parent: MapRef = root;
+            for _ in 0..levels {
+                parent = parent.insert(&mut txn, "c", MapPrelim::default());
+            }
+            parent.insert(&mut txn, "t", "leaf");
+            txn.encode_state_as_update_v1(&StateVector::default())
+        }
+
+        fn map_depth(doc: &Doc) -> usize {
+            let map = doc.get_or_insert_map("m");
+            let txn = doc.transact();
+            let mut value = map.to_json(&txn);
+            let mut depth = 0;
+            while let Any::Map(entries) = value {
+                match entries.get("c") {
+                    Some(inner) => {
+                        depth += 1;
+                        value = inner.clone();
+                    }
+                    None => break,
+                }
+            }
+            depth
+        }
+
+        #[test]
+        fn types_at_the_cap_integrate() {
+            let doc = Doc::with_client_id(2);
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&nested_maps(Update::MAX_TYPE_DEPTH)).unwrap())
+                .unwrap();
+            drop(txn);
+            assert_eq!(map_depth(&doc), Update::MAX_TYPE_DEPTH);
+        }
+
+        #[test]
+        fn a_type_past_the_cap_is_refused() {
+            for levels in [Update::MAX_TYPE_DEPTH + 1, 30_000] {
+                let doc = Doc::with_client_id(2);
+                let mut txn = doc.transact_mut();
+                let result = txn.apply_update(Update::decode_v1(&nested_maps(levels)).unwrap());
+                assert!(
+                    matches!(result, Err(UpdateError::TooDeep(_, Update::MAX_TYPE_DEPTH))),
+                    "{} levels: {:?}",
+                    levels,
+                    result
+                );
+                drop(txn);
+                // What did integrate stops at the cap, and readers that recurse survive it.
+                assert_eq!(map_depth(&doc), Update::MAX_TYPE_DEPTH);
+            }
+        }
+
+        #[test]
+        fn a_refused_deep_chain_can_be_deleted_and_collected() {
+            let doc = Doc::with_client_id(2);
+            let root = doc.get_or_insert_map("m");
+            {
+                let mut txn = doc.transact_mut();
+                let _ = txn.apply_update(Update::decode_v1(&nested_maps(30_000)).unwrap());
+            }
+            {
+                let mut txn = doc.transact_mut();
+                root.remove(&mut txn, "c");
+            }
+            assert_eq!(map_depth(&doc), 0);
+        }
+
+        #[test]
+        fn an_update_carrying_a_deep_any_is_refused_in_v1_and_v2() {
+            fn nested(levels: usize) -> Any {
+                (0..levels).fold(Any::Null, |inner, _| {
+                    Any::Map(Arc::new(HashMap::from([("c".to_string(), inner)])))
+                })
+            }
+            for (levels, refused) in [(Any::MAX_DEPTH, false), (Any::MAX_DEPTH + 1, true)] {
+                let doc = Doc::with_client_id(1);
+                let map = doc.get_or_insert_map("m");
+                let mut txn = doc.transact_mut();
+                map.insert(&mut txn, "v", nested(levels));
+                let v1 = txn.encode_state_as_update_v1(&StateVector::default());
+                let v2 = txn.encode_state_as_update_v2(&StateVector::default());
+                for decoded in [Update::decode_v1(&v1), Update::decode_v2(&v2)] {
+                    if refused {
+                        assert!(matches!(
+                            decoded,
+                            Err(Error::Malformed(MalformedKind::TooDeep))
+                        ));
+                    } else {
+                        assert!(decoded.is_ok());
+                    }
+                }
+            }
+        }
+
+        /// v1 writes embeds and format values as JSON strings and reads them back through
+        /// `serde_json`, whose recursion limit is the tighter bound: a value at the cap must
+        /// still load from the doc's own state, in both encodings.
+        #[test]
+        fn an_embed_and_a_format_at_the_cap_reload_in_v1_and_v2() {
+            use crate::{GetString, Text};
+            let deep =
+                (0..Any::MAX_DEPTH).fold(Any::Null, |inner, _| Any::Array(Arc::from([inner])));
+            let doc = Doc::with_client_id(1);
+            let text = doc.get_or_insert_text("t");
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, "ab");
+            text.insert_embed(&mut txn, 1, deep.clone());
+            text.format(&mut txn, 0, 1, HashMap::from([(Arc::from("f"), deep)]));
+            let v1 = txn.encode_state_as_update_v1(&StateVector::default());
+            let v2 = txn.encode_state_as_update_v2(&StateVector::default());
+            drop(txn);
+            for update in [Update::decode_v1(&v1), Update::decode_v2(&v2)] {
+                let fresh = Doc::with_client_id(2);
+                let mut txn = fresh.transact_mut();
+                txn.apply_update(update.unwrap()).unwrap();
+                drop(txn);
+                let text = fresh.get_or_insert_text("t");
+                assert_eq!(text.get_string(&fresh.transact()), "ab");
+            }
+        }
     }
 
     mod malformed_input {

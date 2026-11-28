@@ -41,6 +41,8 @@ impl Error {
 pub enum MalformedKind {
     Utf8,
     EmptyBlock,
+    /// A map or array nested deeper than [crate::Any::MAX_DEPTH].
+    TooDeep,
 }
 
 impl Display for MalformedKind {
@@ -48,6 +50,11 @@ impl Display for MalformedKind {
         match self {
             MalformedKind::Utf8 => write!(f, "invalid UTF-8 sequence"),
             MalformedKind::EmptyBlock => write!(f, "block cannot have 0 length"),
+            MalformedKind::TooDeep => write!(
+                f,
+                "value nested deeper than {} levels",
+                crate::Any::MAX_DEPTH
+            ),
         }
     }
 }
